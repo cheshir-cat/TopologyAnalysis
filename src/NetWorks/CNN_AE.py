@@ -1,175 +1,114 @@
-import re
-import torch.nn.functional as F
-import pytorch_lightning as pl
-import torch.nn as nn
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
+import torch.nn as nn
+import pytorch_lightning as pl
+from torchmetrics import StructuralSimilarityIndexMeasure
+from sklearn.metrics import roc_auc_score
+import torch.nn.functional as F
+import piq
 
-from torch import optim
-from collections import OrderedDict
-from sklearn.metrics import precision_recall_fscore_support as score
+class CNN_AE(pl.LightningModule):
+    def __init__(self,
+                 anomaly_threshold=0.1,
+                 loader_obj=None):
+        super().__init__()
 
-from src.DataLoad import DataLoader
-
-
-class AE(nn.Module):
-    def __init__(self):
-        super(AE, self).__init__()
-
-        self.loss_array = []
-
-        self.encoder = nn.Sequential(
-            nn.Linear(12, 24),
+        # CNN part
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),  # (16, 60, 60)
             nn.ReLU(),
-            nn.Linear(24, 20),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),  # (32, 30, 30)
             nn.ReLU(),
-            nn.Linear(20, 10),
-            nn.Sigmoid()
         )
 
-        self.decoder = nn.Sequential(
-            nn.Linear(10, 20),
-            nn.ReLU(),
-            nn.Linear(20, 24),
-            nn.ReLU(),
-            nn.Linear(24, 12),
-            nn.Sigmoid()
-        )
+        # Flatten
+        self.flatten = nn.Flatten()
+
+        # AE part
+        self.encoder = None
+        self._encoded_size = None
+        self.decoder = None
+
+        # Threshold for anomaly detection
+        self.anomaly_threshold = anomaly_threshold
+        self.loader_obj = loader_obj
+
+        self.mse_metric = nn.MSELoss()
+        self.ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0)
+        self._cnn_out_shape = None
+
+        self.save_hyperparameters()
 
     def forward(self, x):
-        encoded = self.encoder(x)
-        #print("\n encoded: ", encoded.shape)
+        cnn_out = self.cnn(x)
+
+        if self._cnn_out_shape is None:
+            self._cnn_out_shape = cnn_out.shape[1:]  # (C, H, W)
+
+            flattened_dim = cnn_out.numel() // cnn_out.shape[0]
+
+            self.encoder = nn.Sequential(
+                nn.Linear(flattened_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64)
+            ).to(x.device)
+
+            self.decoder = nn.Sequential(
+                nn.Linear(64, 128),
+                nn.ReLU(),
+                nn.Linear(128, flattened_dim),
+                nn.ReLU()
+            ).to(x.device)
+
+        flat = self.flatten(cnn_out)
+        encoded = self.encoder(flat)
         decoded = self.decoder(encoded)
-        #print("\n decoded: ", decoded.shape)
+        return flat, decoded
 
-        #print("\n reconstruct error: ", F.mse_loss(decoded, x))
+    def training_step(self, batch, batch_idx):
+        x, y = batch  # assume batch is (B, 1, w, w)
+        x_flat, x_reconstructed = self.forward(x)
+        loss = self.loss(x_reconstructed, x_flat, x, stage="train")
+        return loss
 
-        self.loss_array.append(float(F.mse_loss(decoded, x)))
-        return decoded
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        x_flat, x_reconstructed = self.forward(x)
+        loss = self.loss(x_reconstructed, x_flat, x, stage="test")
+        return loss, x_flat, x_reconstructed
 
-    def plot_loss(self):
-        plt.plot(self.loss_array)
-        plt.title("Reconstruct error graph")
-        plt.xlabel("Epoch stage")
-        plt.ylabel("Error")
-        plt.show()
+    def loss(self, x_reconstructed, x_flat, x, stage="train"):
+        mse = self.mse_metric(x_reconstructed, x_flat)
 
+        B = x.shape[0]
+        C, H, W = self._cnn_out_shape
 
-class CNN_AE_Model(pl.LightningModule):
-    def __init__(self, path):
-        super(CNN_AE_Model, self).__init__()
+        x_flat_reshaped = x_flat.view(B, C, H, W)
+        x_reconstructed_reshaped = x_reconstructed.view(B, C, H, W)
 
-        self.path = path
-        self.loader_obj = DataLoader(path)
-        self.loss_array = []
+        ssim_value = self.ssim_metric(x_reconstructed_reshaped, x_flat_reshaped)
+        psnr_value = piq.psnr(x_reconstructed_reshaped, x_flat_reshaped, data_range=1.0)
 
-        self.build_model()
+        loss = mse + (1 - ssim_value)
 
-    def build_model(self):
-        self.conv = nn.Conv2d(3, 3, 5, stride=2, padding=2)
-
-        #в зависимости от окна настраиваем слой
-        if re.findall(r"\d+", self.path)[-1] == "30":
-            self.fc = nn.Linear(12, 12)
-        elif re.findall(r"\d+", self.path)[-1] == "60":
-            self.fc = nn.Linear(48, 12)
-        elif re.findall(r"\d+", self.path)[-1] == "90":
-            self.fc = nn.Linear(75, 12)
-        elif re.findall(r"\d+", self.path)[-1] == "120":
-            self.fc = nn.Linear(147, 12)
-
-        self.fc2 = nn.Linear(12, 1)
-
-        self.auto_encoder = AE()
-
-        self.pool = nn.MaxPool2d(2, 2)
-
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv(x)))
-        #print("\n x1: ", x.shape)
-        x = self.pool(F.relu(self.conv(x)))
-        #print("x2: ", x.shape)
-
-        x = x.view(x.size(0), -1)
-        #print("x view: ", x.shape)
-
-        x = F.relu(self.fc(x))
-        #print("x fc1: ", x.shape)
-
-        x = self.auto_encoder.forward(x)
-
-        x = self.fc2(x)
-        #print("x fc2: ", x.shape)
-
-        x = x.squeeze()
-        return x
-
-    def training_step(self, x):
-        x, y = x
-        #print("\n x: ", x.shape, " y: ", y.shape)
-
-        y_hat = self.forward(x)
-        print("\n y_hat: ", y_hat.shape, y_hat)
-        loss = self.loss(y.float(), y_hat)
-        loss = loss.unsqueeze(0)
-
-        output = OrderedDict({
-            'loss': loss,
-            'y': y,
-            'y_hat': y_hat,
-        })
-        return output
-
-    def predict(self, data):
-        y_arr = []
-        predicted_array = []
-
-        for x, y in data:
-            predicted = self.forward(x).argmax(axis=1).round()
-            print("\n predicted: ", predicted.shape, predicted)
-
-            y_arr.append(y)
-            predicted_array.append(predicted)
-
-        y_arr = torch.cat(y_arr)
-        predicted_array = torch.cat(predicted_array)
-
-        precision, recall, fscore, _ = score(y_arr.detach().numpy(), predicted_array.detach().numpy())
-        print("precision: ", precision, "recall: ", recall, "fscore: ", fscore)
-
-        return predicted_array
-
-    """def predict(self, x):
-        x, y = next(iter(x))
-        #print("\n x: ", x.shape, " y: ", y.shape)
-
-        predicted = self.forward(x).round()
-        #print("\n predicted: ", predicted.shape)
-
-        precision, recall, fscore, _ = score(y.detach().numpy(), predicted.detach().numpy())
-        print("precision: ", precision, "recall: ", recall, "fscore: ", fscore)
-
-        return self.forward(x)"""
-
-    def loss(self, y, restored):
-        loss = F.mse_loss(y, restored)
-        self.loss_array.append(float(loss))
+        self.log(f"{stage}_mse", mse, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}_psnr", psnr_value, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}_ssim", ssim_value, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
         return loss
 
-    def plot_loss(self):
-        #self.auto_encoder.plot_loss()
-
-        plt.plot(self.loss_array)
-        plt.title("Loss graph")
-        plt.xlabel("Epoch step")
-        plt.ylabel("Loss")
-        plt.show()
-
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
         return optimizer
+
+    def calculate_roc_auc(self, batch):
+        x, y = batch
+        x_flat, x_reconstructed = self.forward(x)
+        reconstruction_error = F.mse_loss(x_reconstructed, x_flat, reduction='none').view(x.size(0), -1).sum(dim=1)
+        labels = (reconstruction_error > self.anomaly_threshold).float()  # Assuming anomaly is defined by reconstruction error
+
+        auc = roc_auc_score(labels.cpu().numpy(), reconstruction_error.cpu().numpy())
+        return auc
 
     def train_dataloader(self):
         return self.loader_obj.load_images_from_folder(type="train")
